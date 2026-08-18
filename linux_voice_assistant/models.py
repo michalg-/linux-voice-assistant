@@ -174,6 +174,7 @@ class ServerState:
     mic_volume: int = 100  # 1–100, default maximum
     audio_input_channels: int = 2  # number of mic channels to stream
     timer_max_ring_seconds: float = 900.0
+    listen_during_wake_sound: bool = False
 
     def broadcast(self, msgs: "Iterable[message.Message]") -> None:
         """Send messages to every connected API client.
@@ -216,6 +217,7 @@ class ServerState:
             _LOGGER.debug("Skipping save - volume unchanged")
             return
 
+        previous_muted = self.volume == 0.0
         self.volume = clamped_volume
         self.preferences.volume = clamped_volume
         _LOGGER.info("Saving volume %s to %s", clamped_volume, self.preferences_path)
@@ -228,6 +230,10 @@ class ServerState:
             from .peripheral_api import LVAEvent  # local import avoids circular dep
 
             api.emit_event_sync(LVAEvent.VOLUME_CHANGED, {"volume": round(clamped_volume, 3)})
+
+            new_muted = clamped_volume == 0.0
+            if previous_muted != new_muted:
+                api.emit_event_sync(LVAEvent.VOLUME_MUTED, {"muted": new_muted})
 
     def persist_mic_gain(self, gain: float) -> None:
         """Persist the microphone auto gain value."""
@@ -259,3 +265,14 @@ class ServerState:
         self.preferences.mic_volume = volume_int
         _LOGGER.info("Saving mic_volume %s to %s", volume_int, self.preferences_path)
         self.save_preferences()
+
+
+def initial_stop_word_threshold(saved_sensitivity: Optional[float]) -> float:
+    """
+    Resolve the stop word probability cutoff to start from, clamped to 0.0-1.0.
+    :param saved_sensitivity: Value persisted in preferences, or None if it has never been set.
+    """
+    if saved_sensitivity is None:
+        return ServerState.stop_word_threshold
+
+    return max(0.0, min(1.0, float(saved_sensitivity)))

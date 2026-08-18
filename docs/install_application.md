@@ -176,6 +176,7 @@ Environment=PREFERENCES_FILE="/home/pi/linux-voice-assistant/preferences.json"
 # Environment=PORT="6053"
 # Environment=AUDIO_INPUT_DEVICE="default"
 # Environment=AUDIO_OUTPUT_DEVICE="default"
+# Environment=MUSIC_OUTPUT_DEVICE="default"
 # Environment=MIC_VOLUME="1.0"
 # Environment=MIC_AUTO_GAIN="0"
 # Environment=MIC_NOISE_SUPPRESSION="0"
@@ -191,6 +192,7 @@ Environment=PREFERENCES_FILE="/home/pi/linux-voice-assistant/preferences.json"
 # Environment=START_LISTENING_SOUND="sounds/start_listening_button.flac"
 # Environment=TIMER_FINISHED_SOUND="sounds/timer_finished.flac"
 # Environment=PROCESSING_SOUND="sounds/processing.wav"
+# Environment=LISTEN_DURING_WAKE_SOUND="0"
 # Environment=MUTE_SOUND="sounds/mute_switch_on.flac"
 # Environment=UNMUTE_SOUND="sounds/mute_switch_off.flac"
 # Environment=PERIPHERAL_HOST="0.0.0.0"
@@ -259,16 +261,20 @@ The following variables can be configured in the `.env` or in the service file:
 | `LVA_PULSE_SERVER` | `/run/user/${LVA_USER_ID}/pulse/native` | Path to the PulseAudio/PipeWire socket (In some cases a `:unix`infront of the path is needed) |
 | `LVA_XDG_RUNTIME_DIR` | `/run/user/${LVA_USER_ID}` | XDG runtime directory |
 | `LVA_PULSE_COOKIE` | `/app/configuration/tmp_pulse_cookie` | Cookie file for PulseAudio if you use encryption. By default disabled. We use a tmp file to avoid errors if the file is not found |
+| `ENABLE_DEBUG` | (optional) | Set to "1" to enable debug mode |
+| `ENABLE_COLORED_DEBUG` | (optional) | Set to "1" to enable colored debug mode |
+| `LIST_DEVICES` | (optional) | Set to "1" to list audio devices instead of starting |
 | `PREFERENCES_FILE` | (optional) | Path to a custom preferences JSON file |
 | `NETWORK_INTERFACE` | Autodetected | network card for server |
 | `HOST` | Autodetected | API server IP-Address, can be 0.0.0.0 for all interfaces, but only one network card works for MAC-ADDRESS and ESP protocol |
 | `PORT` | `6053` | API server port |
 | `AUDIO_INPUT_DEVICE` | Autodetected | Audio input device name |
 | `AUDIO_OUTPUT_DEVICE` | Autodetected | Audio output device name |
-| `MIC_VOLUME` | Control microphone volume | 100 |
-| `MIC_AUTO_GAIN` | Add WebRTC Gain to Mic | 0 |
-| `MIC_NOISE_SUPPRESSION` | Add WebRTC Noise Suppresion to Mic | 0 |
-| `AUDIO_INPUT_CHANNELS` | Number of audio input channels | 2 |
+| `MUSIC_OUTPUT_DEVICE` | `AUDIO_OUTPUT_DEVICE` | Music/media output device name (defaults to the voice output device) |
+| `MIC_VOLUME` | 100 | Control microphone volume |
+| `MIC_AUTO_GAIN` | 0 | Add WebRTC Gain to Mic |
+| `MIC_NOISE_SUPPRESSION` | 0 | Add WebRTC Noise Suppression to Mic |
+| `AUDIO_INPUT_CHANNELS` | 2 | Number of audio input channels |
 | `ENABLE_THINKING_SOUND` | false | Set to "1" to enable thinking sound |
 | `WAKE_WORD_DIR` | `app/wakewords` | Path to the wake word directory |
 | `WAKE_MODEL` | `okay_nabu` | Wake word model to use |
@@ -280,8 +286,9 @@ The following variables can be configured in the `.env` or in the service file:
 | `START_LISTENING_SOUND` | `sounds/start_listening_button.flac` | Sound file for pressing button to talk |
 | `TIMER_FINISHED_SOUND` | `sounds/timer_finished.flac` | Sound file for timer finished |
 | `PROCESSING_SOUND` | `sounds/processing.wav` | Sound file for processing state |
+| `LISTEN_DURING_WAKE_SOUND` | false | Set to "1" to start listening immediately after wake word detection, without waiting for the wake sound to finish |
 | `MUTE_SOUND` | `sounds/mute_switch_on.flac` | Sound file for mute on |
-| `UNMUTE_SOUND` | `sounds/mute_switch_off.flac` | Sound file for Configure Audio Devices
+| `UNMUTE_SOUND` | `sounds/mute_switch_off.flac` | Sound file for mute off |
 | `PERIPHERAL_HOST` | 0.0.0.0 | Host for the peripheral WebSocket API |
 | `PERIPHERAL_PORT` | 6055 | Port for the peripheral WebSocket API |
 | `PERIPHERAL_VOLUME_STEP` | %(default)s | Volume change per button press |
@@ -291,12 +298,25 @@ The following variables can be configured in the `.env` or in the service file:
 
 💡 **Note:** For the systemd installation some variables set in the service need to be without `LVA_` prefix.
 
+### Feature: Listen During Wake Sound
+
+By default, LVA waits until the wake sound has finished playing before it starts listening for your spoken command. This can force a short pause between saying the wake word and the rest of your request. For example:  `Okay Nabu <pause until wake sound finishes> turn on the kitchen lights`.
+
+Enable `LISTEN_DURING_WAKE_SOUND="1"` to let LVA begin listening immediately after the wake word is detected, even while the wake sound is still playing. This allows you to say the wake word and the full command in one go.
+
+This feature is especially useful when you want a more natural interaction flow and do not want to wait to confirm that the wake word was detected before speaking the command.
+
+Keep in mind that listening while the wake sound is playing can also make the microphone pick up some of that wake sound as echo, depending on your speaker and microphone setup. This echo can interfere with speech-to-text and make commands less accurate. If you run into this, see [Enabling Acoustic Echo Cancellation (AEC)](enabling_aec.md).
+
+
 ### Use own soundfiles:
 
 If you want to use your own sounds, you can add them to the `sounds/custom` aka `/var/lib/docker/volumes/lva_sounds_custom/_data` directory and reference them in the `.env` file.
 
 
 ### Wake Word:
+
+💡 **Note:** The active wake word(s) can also be changed at runtime from the Home Assistant device page, without editing `.env` or restarting LVA — see [Wake Word](configuration.md#wake-word) in the dashboard documentation.
 
 #### Available Wake Word Models:
 
@@ -310,7 +330,6 @@ The following wake word models are available:
 - `hey_morgan` - Morgan wake word
 - `hey_luna` - Luna wake word
 - `hey_home_assistant` - Home Assistant wake word
-- `stop` - Stop wake word
 - `okay_computer` - Okay Computer wake word
 - `choo_choo_homie` - Choo Choo Homie wake word
 
@@ -321,6 +340,9 @@ The following wake word models are available:
 - `hey_mycroft` - Mycroft wake word
 - `hey_rhasspy` - Rhasspy wake word
 
+### Stop Word:
+
+The `stop` wake word is used to stop the current process (response, announcement, or timer). It is available in the `wakewords` directory (using the microWakeWord engine) and can be referenced in the `.env` file with `STOP_MODEL=stop`.
 
 ### Custom Wake Word:
 
