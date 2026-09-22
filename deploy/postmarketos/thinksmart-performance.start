@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+cpu_rate_limit="/sys/devices/system/cpu/cpufreq/schedutil/rate_limit_us"
+gpu_poll_interval="/sys/class/devfreq/1c00000.gpu/polling_interval"
+
+if [ -w "$cpu_rate_limit" ]; then
+  echo 1000 > "$cpu_rate_limit"
+fi
+
+if [ -w "$gpu_poll_interval" ]; then
+  echo 20 > "$gpu_poll_interval"
+fi
