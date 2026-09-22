@@ -14,9 +14,11 @@ can be rebased onto future upstream releases.
 | `thinksmart-audio-keepalive.sh` | `/usr/local/bin/thinksmart-audio-keepalive` |
 | `thinksmart-audio-keepalive.initd` | `/etc/init.d/thinksmart-audio-keepalive` |
 
-The keepalive holds the QDSP6/TAS5782M PCM path open with zero samples. Without
-it, the kernel powers the amplifier DSP down and its 0.7-0.8 second startup
-clips short sounds and the beginning of TTS playback.
+The keepalive holds the QDSP6/TAS5782M PCM path open with a muted PulseAudio
+in-server stream. Without it, the kernel powers the amplifier DSP down and its
+0.7-0.8 second startup clips short sounds and the beginning of TTS playback.
+Keeping the stream inside PulseAudio avoids the CPU cost of continuously
+copying zero PCM through a separate `pacat` client.
 
 The launcher uses `parec` to provide stereo signed 16-bit PCM directly from
 PulseAudio. This avoids the CPU-heavy float conversion in the Python
