@@ -20,6 +20,21 @@ class TestInit:
         sat = make_satellite(tmp_path)
         assert sat.state.connected is False
 
+    def test_secondary_connection_does_not_take_microphone_ownership(self, tmp_path):
+        state = make_state(tmp_path)
+
+        with (
+            patch("linux_voice_assistant.satellite.WakeWord1SensitivityNumberEntity", MagicMock()),
+            patch("linux_voice_assistant.satellite.WakeWord2SensitivityNumberEntity", MagicMock()),
+            patch("linux_voice_assistant.satellite.StopWordSensitivityNumberEntity", MagicMock()),
+        ):
+            from linux_voice_assistant.satellite import VoiceSatelliteProtocol
+
+            primary = VoiceSatelliteProtocol(state)
+            VoiceSatelliteProtocol(state)
+
+        assert state.satellite is primary
+
     def test_media_player_entity_created(self, tmp_path):
         from linux_voice_assistant.entity import MediaPlayerEntity
 
@@ -345,6 +360,28 @@ class TestConnectionLost:
         sat = make_satellite(tmp_path)
         sat.connection_lost(None)
         assert sat.state.satellite is None
+
+    def test_connection_lost_falls_back_to_authenticated_connection(self, tmp_path):
+        primary = make_satellite(tmp_path)
+        state = primary.state
+
+        with (
+            patch("linux_voice_assistant.satellite.WakeWord1SensitivityNumberEntity", MagicMock()),
+            patch("linux_voice_assistant.satellite.WakeWord2SensitivityNumberEntity", MagicMock()),
+            patch("linux_voice_assistant.satellite.StopWordSensitivityNumberEntity", MagicMock()),
+        ):
+            from linux_voice_assistant.satellite import VoiceSatelliteProtocol
+
+            replacement = VoiceSatelliteProtocol(state)
+
+        primary._authenticated = True
+        replacement._authenticated = True
+        state.connections = [primary, replacement]
+        state.satellite = primary
+
+        primary.connection_lost(None)
+
+        assert state.satellite is replacement
 
     def test_connection_lost_stops_streaming(self, tmp_path):
         sat = make_satellite(tmp_path)

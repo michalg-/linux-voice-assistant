@@ -40,6 +40,13 @@ class LibMpvPlayer(AudioPlayer):
         if device:
             self._mpv["audio-device"] = device
 
+        # Keep the hardware-compatible sample format used by the previous
+        # Wyoming satellite.  Do not enlarge PulseAudio's output buffer: mpv
+        # may tear it down at EOF before a large buffer is fully drained,
+        # clipping the end of short TTS responses.
+        self._mpv["audio-format"] = "s16"
+        self._mpv["pulse-buffer"] = 100
+
         # Pre-buffer audio before the sink starts clocking samples out.
         # The default (0.2 s) is too tight for short notification sounds on
         # PulseAudio/PipeWire: the sink stream takes a few ms to initialise
@@ -80,6 +87,18 @@ class LibMpvPlayer(AudioPlayer):
             self._log.debug("play: current_state=%s", self._state)
             self._done_callback = done_callback
             self._set_state(PlayerState.LOADING)
+
+        # Piper voices do not produce a consistent amount of leading silence
+        # (measured responses varied from 47 to 89 ms).  The ThinkSmart audio
+        # path needs a short run-in even while its PCM/DSP route is kept open,
+        # so prepend a small preroll to Home Assistant TTS only.  Chimes and
+        # ordinary media remain untouched.  The filter also extends the file,
+        # therefore no samples are discarded at the end.
+        if "/api/tts_proxy/" in url:
+            self._mpv["af"] = "lavfi=[adelay=100|100]"
+        else:
+            self._mpv["af"] = ""
+
         self._mpv.pause = stop_first
         self._mpv.play(url)
 

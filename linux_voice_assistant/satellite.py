@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import logging
+import math
 import posixpath
 import shutil
 import threading
@@ -71,6 +72,13 @@ PROTO_TO_MESSAGE_TYPE = {v: k for k, v in MESSAGE_TYPE_TO_PROTO.items()}
 
 _HAS_AUDIO_DATA2 = "data2" in {f.name for f in VoiceAssistantAudio.DESCRIPTOR.fields}
 
+# Reject server-side VAD false positives caused by steady room noise.  At the
+# current 1024-sample/16 kHz input size this requires roughly 190 ms of local
+# audio above -45 dBFS.  The measured idle noise floor on this device is about
+# -62 dBFS, leaving enough margin for quiet speech.
+_LOCAL_SPEECH_RMS = 180
+_LOCAL_SPEECH_MIN_CHUNKS = 3
+
 
 class VoiceSatelliteProtocol(APIServer):
 
@@ -78,7 +86,13 @@ class VoiceSatelliteProtocol(APIServer):
         super().__init__(state.name)
 
         self.state = state
-        self.state.satellite = self
+        # APIServer constructs one protocol object per TCP client.  Home
+        # Assistant and discovery/diagnostic clients may briefly overlap; a
+        # newly constructed secondary connection must not steal microphone
+        # ownership from the established HA connection.
+        if self.state.satellite is None:
+            self.state.satellite = self
+        self._authenticated = False
         self.state.connected = False
 
         # Report capabilities appropriately
@@ -346,6 +360,11 @@ class VoiceSatelliteProtocol(APIServer):
         self._timer_ring_start: Optional[float] = None
         self._processing = False
         self._pipeline_active = False
+        self._speech_detected = False
+        self._speech_energy_chunks = 0
+        self._speech_peak = 0
+        self._ignore_current_pipeline = False
+        self._listen_watchdog: Optional[threading.Timer] = None
         self._external_wake_words: Dict[str, VoiceAssistantExternalWakeWord] = {}
         self._disconnect_event = asyncio.Event()
 
@@ -514,8 +533,17 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_played = False
             self._continue_conversation = False
             self._pipeline_active = True
+            self._speech_detected = False
+            self._speech_energy_chunks = 0
+            self._speech_peak = 0
+            self._ignore_current_pipeline = False
+
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_START:
+            self._speech_detected = True
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_START:
+            if self._ignore_current_pipeline:
+                return
             self._emit(LVAEvent.THINKING)
             # Play optional audible thinking sound
             if self.state.thinking_sound_enabled:
@@ -532,7 +560,26 @@ class VoiceSatelliteProtocol(APIServer):
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
         ):
             self._is_streaming_audio = False
+            self._cancel_listen_watchdog()
+            if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END and ((not self._speech_detected) or (self._speech_energy_chunks < _LOCAL_SPEECH_MIN_CHUNKS)):
+                _LOGGER.info(
+                    "Ignoring voice pipeline: no local speech (vad=%s, active_chunks=%d, peak=%d)",
+                    self._speech_detected,
+                    self._speech_energy_chunks,
+                    self._speech_peak,
+                )
+                self._ignore_current_pipeline = True
+                self.send_messages([VoiceAssistantRequest(start=False)])
             if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_END:
+                if self._speech_energy_chunks < _LOCAL_SPEECH_MIN_CHUNKS:
+                    _LOGGER.info(
+                        "Ignoring STT result without local speech (active_chunks=%d, peak=%d, text=%r)",
+                        self._speech_energy_chunks,
+                        self._speech_peak,
+                        data.get("text", ""),
+                    )
+                    self._ignore_current_pipeline = True
+                    return
                 stt_text = data.get("text", "").strip()
                 if stt_text:
                     self._emit(LVAEvent.STT_TEXT, {"text": stt_text})
@@ -548,6 +595,8 @@ class VoiceSatelliteProtocol(APIServer):
                 self._continue_conversation = True
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_START:
+            if self._ignore_current_pipeline:
+                return
             tts_text = data.get("text", "").strip()
             if tts_text:
                 self._emit(LVAEvent.TTS_TEXT, {"text": tts_text})
@@ -559,6 +608,14 @@ class VoiceSatelliteProtocol(APIServer):
 
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
             self._is_streaming_audio = False
+            self._cancel_listen_watchdog()
+            if self._ignore_current_pipeline:
+                self._pipeline_active = False
+                self._ignore_current_pipeline = False
+                self._speech_detected = False
+                self.unduck()
+                self._emit(LVAEvent.IDLE)
+                return
             if not self._tts_played:
                 self._pipeline_active = False
                 self._tts_finished()
@@ -806,6 +863,19 @@ class VoiceSatelliteProtocol(APIServer):
     def handle_audio(self, audio_chunk: bytes, audio_chunk_2: Optional[bytes] = None) -> None:
         if not self._is_streaming_audio or self.state.muted:
             return
+
+        # Independently validate that the local microphone actually captured
+        # speech. Home Assistant's VAD can occasionally trigger on low-level
+        # room noise and Whisper then hallucinates a short phrase such as
+        # "Dziękuję". Audio is signed 16-bit little-endian PCM on this device.
+        samples = memoryview(audio_chunk).cast("h")
+        if samples:
+            peak = max(abs(sample) for sample in samples)
+            rms = math.isqrt(sum(sample * sample for sample in samples) // len(samples))
+            self._speech_peak = max(self._speech_peak, peak)
+            if rms >= _LOCAL_SPEECH_RMS:
+                self._speech_energy_chunks += 1
+
         if _HAS_AUDIO_DATA2 and audio_chunk_2 is not None:
             self.send_messages([VoiceAssistantAudio(data=audio_chunk, data2=audio_chunk_2)])
         else:
@@ -850,19 +920,53 @@ class VoiceSatelliteProtocol(APIServer):
             "Starting audio streaming for: %s",
             wake_word_phrase,
         )
+        self._speech_detected = False
+        self._speech_energy_chunks = 0
+        self._speech_peak = 0
         self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
         self._is_streaming_audio = True
         self._emit(LVAEvent.LISTENING)
+        self._start_listen_watchdog()
+
+    def _cancel_listen_watchdog(self) -> None:
+        watchdog = self._listen_watchdog
+        self._listen_watchdog = None
+        if watchdog is not None:
+            watchdog.cancel()
+
+    def _start_listen_watchdog(self) -> None:
+        """Recover if HA never closes a voice pipeline after STT starts."""
+        self._cancel_listen_watchdog()
+        watchdog = threading.Timer(15.0, self._listen_timed_out)
+        watchdog.daemon = True
+        self._listen_watchdog = watchdog
+        watchdog.start()
+
+    def _listen_timed_out(self) -> None:
+        if not self._is_streaming_audio:
+            return
+
+        _LOGGER.warning("Voice pipeline timed out while listening; resetting local state")
+        self._listen_watchdog = None
+        self._is_streaming_audio = False
+        self._pipeline_active = False
+        self._ignore_current_pipeline = True
+        try:
+            self.send_messages([VoiceAssistantRequest(start=False)])
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not stop timed-out voice pipeline", exc_info=True)
+        self.unduck()
+        self._emit(LVAEvent.IDLE)
 
     def _on_wakeup_sound_finished(self, wake_word_phrase: str) -> None:
         """Callback invoked when the wakeup chime finishes; begin STT streaming."""
         _LOGGER.debug(
-            "Wakeup sound finished, starting audio streaming for: %s",
+            "Wakeup sound finished, waiting for speaker echo to settle: %s",
             wake_word_phrase,
         )
-        self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)])
-        self._is_streaming_audio = True
-        self._emit(LVAEvent.LISTENING)
+        settle_timer = threading.Timer(0.60, self._start_audio_streaming, args=(wake_word_phrase,))
+        settle_timer.daemon = True
+        settle_timer.start()
 
     def start_listening(self) -> None:
         """
@@ -893,12 +997,13 @@ class VoiceSatelliteProtocol(APIServer):
 
     def _on_start_listening_sound_finished(self) -> None:
         """Callback invoked when the start-listening chime finishes; begin STT streaming."""
-        _LOGGER.debug("Start-listening sound finished, starting audio streaming")
-        self.send_messages([VoiceAssistantRequest(start=True, wake_word_phrase="")])
-        self._is_streaming_audio = True
-        self._emit(LVAEvent.LISTENING)
+        _LOGGER.debug("Start-listening sound finished, waiting for speaker echo to settle")
+        settle_timer = threading.Timer(0.60, self._start_audio_streaming, args=("",))
+        settle_timer.daemon = True
+        settle_timer.start()
 
     def stop(self) -> None:
+        self._cancel_listen_watchdog()
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False
 
@@ -920,7 +1025,7 @@ class VoiceSatelliteProtocol(APIServer):
     # ------------------------------------------------------------------
 
     def play_tts(self) -> None:
-        if (not self._tts_url) or self._tts_played:
+        if self._ignore_current_pipeline or (not self._tts_url) or self._tts_played:
             return
 
         self._tts_played = True
@@ -1015,6 +1120,18 @@ class VoiceSatelliteProtocol(APIServer):
         if self not in self.state.connections:
             self.state.connections.append(self)
 
+    @property
+    def authenticated(self) -> bool:
+        """Return whether this API connection completed authentication."""
+        return self._authenticated
+
+    def reset_for_connection_handoff(self) -> None:
+        """Reset per-connection pipeline state before taking microphone ownership."""
+        self._is_streaming_audio = False
+        self._pipeline_active = False
+        self._ignore_current_pipeline = False
+        self._cancel_listen_watchdog()
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -1022,12 +1139,18 @@ class VoiceSatelliteProtocol(APIServer):
     def connection_lost(self, exc: Optional[Exception]) -> None:
         super().connection_lost(exc)
 
+        was_pipeline_active = self._pipeline_active or self._is_streaming_audio
         self._disconnect_event.set()
+        self._cancel_listen_watchdog()
         self._is_streaming_audio = False
         self._tts_url = None
         self._tts_played = False
         self._continue_conversation = False
         self._timer_finished = False
+        self._speech_detected = False
+        self._speech_energy_chunks = 0
+        self._speech_peak = 0
+        self._ignore_current_pipeline = False
         self._pipeline_active = False
 
         # Deregister this connection.
@@ -1054,7 +1177,25 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.connected = False
 
         if self.state.satellite is self:
-            self.state.satellite = None
+            # HA can briefly keep overlapping API connections while
+            # reconnecting.  Dropping the newest one used to set the shared
+            # satellite reference to None even though an older live connection
+            # remained.  The microphone worker then stopped feeding both the
+            # wake-word detector and HA until the whole process was restarted.
+            # Never hand microphone ownership to a half-open discovery socket.
+            # Prefer the newest connection that completed authentication.
+            replacement = next(
+                (connection for connection in reversed(self.state.connections) if connection.authenticated),
+                None,
+            )
+            self.state.satellite = replacement
+            if replacement is not None:
+                replacement.reset_for_connection_handoff()
+                _LOGGER.info("Switched microphone processing to an existing HA connection")
+
+        if was_pipeline_active:
+            self.unduck()
+            self._emit(LVAEvent.IDLE)
 
         if self.state.mute_switch_entity is not None:
             self.state.mute_switch_entity.sync_with_state()
@@ -1068,17 +1209,30 @@ class VoiceSatelliteProtocol(APIServer):
         if self.state.mic_volume_entity is not None:
             self.state.mic_volume_entity.sync_with_state()
 
-        # Notify peripheral container that HA is no longer reachable
-        self._emit(LVAEvent.DISCONNECTED)
-
-        _LOGGER.info("Disconnected from Home Assistant; waiting for reconnection")
+        if not self.state.connections:
+            # Notify peripherals only when HA is genuinely unreachable. An
+            # overlapping/redundant API connection closing must not leave the
+            # display in a false disconnected/listening state.
+            self._emit(LVAEvent.DISCONNECTED)
+            _LOGGER.info("Disconnected from Home Assistant; waiting for reconnection")
+        else:
+            _LOGGER.debug("API client disconnected; %d live connection(s) remain", len(self.state.connections))
 
     def process_packet(self, msg_type: int, packet_data: bytes) -> None:
         super().process_packet(msg_type, packet_data)
 
         if msg_type == PROTO_TO_MESSAGE_TYPE[AuthenticationRequest]:
+            self._authenticated = True
             self.state.connected = True
             _LOGGER.debug("Authentication successful, connected to Home Assistant")
+
+            # Select this authenticated connection only when there is no live
+            # owner.  Do not replace a working HA connection merely because a
+            # second API client authenticated.
+            active_satellite = self.state.satellite
+            if active_satellite is None or active_satellite not in self.state.connections or not active_satellite.authenticated:
+                self.state.satellite = self
+                _LOGGER.info("Selected authenticated HA connection for microphone processing")
 
             # Send states after connect
             states: List[message.Message] = []

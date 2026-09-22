@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+
+name="Linux Voice Assistant"
+description="OHF Linux Voice Assistant for ThinkSmart Voice"
+
+supervisor=supervise-daemon
+command=/home/pmos/linux-voice-assistant/run-lva.sh
+command_user="pmos:pmos"
+directory=/home/pmos/linux-voice-assistant
+
+output_log=/var/log/linux-voice-assistant.log
+error_log=/var/log/linux-voice-assistant.log
+
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need net
+	after avahi-daemon user.pmos
+}
+
+start_pre() {
+	checkpath --file --owner "$command_user" --mode 0644 "$output_log"
+}
+

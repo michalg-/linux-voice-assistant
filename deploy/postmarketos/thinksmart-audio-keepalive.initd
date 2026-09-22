@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+
+name="ThinkSmart audio keepalive"
+description="Keep the QDSP6/TAS5782M speaker PCM path active"
+
+supervisor=supervise-daemon
+command=/usr/local/bin/thinksmart-audio-keepalive
+command_user="pmos:pmos"
+
+output_log=/var/log/thinksmart-audio-keepalive.log
+error_log=/var/log/thinksmart-audio-keepalive.log
+
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	after pulseaudio user.pmos
+}
+
+start_pre() {
+	checkpath --file --owner "$command_user" --mode 0644 "$output_log"
+}
+
