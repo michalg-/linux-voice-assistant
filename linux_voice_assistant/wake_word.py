@@ -4,12 +4,38 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Union
 
+import numpy as np
 from pymicro_wakeword import MicroWakeWord
 from pyopen_wakeword import OpenWakeWord
 
-from .models import AvailableWakeWord, WakeWordType
+from .models import AvailableWakeWord, ServerState, WakeWordType
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def process_stop_word(state: ServerState, micro_inputs: List[np.ndarray], was_active: bool) -> bool:
+    """Process the stop model only while stopping playback is available."""
+    active = (state.stop_word.id in state.active_wake_words) and not state.muted
+    if not active:
+        return False
+
+    if not was_active:
+        state.stop_word.reset()
+
+    stopped = False
+    state.stop_word.debug_probabilities = False
+    state.stop_word.probability_cutoff = state.stop_word_threshold
+    for micro_input in micro_inputs:
+        if state.stop_word.process_streaming(micro_input):
+            state.stop_word.debug_probabilities = True
+            stopped = True
+
+    if stopped:
+        _LOGGER.debug("Stop word detected")
+        assert state.satellite is not None
+        state.satellite.stop()
+
+    return True
 
 
 def find_available_wake_words(wake_word_dirs: List[Path], stop_model_id: str) -> Dict[str, AvailableWakeWord]:

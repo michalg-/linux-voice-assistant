@@ -18,6 +18,7 @@ from getmac import get_mac_address  # type: ignore
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
+from .audio_input import CommandMicrophone
 from .models import Preferences, ServerState, WakeWordType
 from .mpv_player import MpvMediaPlayer
 from .peripheral_api import LVAEvent, PeripheralAPIServer
@@ -28,7 +29,7 @@ from .util import (
     get_esphome_version,
     get_version,
 )
-from .wake_word import find_available_wake_words, load_stop_model, load_wake_models
+from .wake_word import find_available_wake_words, load_stop_model, load_wake_models, process_stop_word
 from .webrtc import WebRTCProcessor
 from .zeroconf import HomeAssistantZeroconf
 
@@ -51,6 +52,10 @@ async def main() -> None:
     parser.add_argument(
         "--audio-input-device",
         help="Name for the audio input device (see --list-input-devices)",
+    )
+    parser.add_argument(
+        "--audio-input-command",
+        help="Command that writes raw signed 16-bit little-endian PCM to stdout (used instead of --audio-input-device)",
     )
     parser.add_argument(
         "--list-input-devices",
@@ -330,7 +335,9 @@ async def main() -> None:
     args.download_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve microphone
-    if args.audio_input_device is not None:
+    if args.audio_input_command:
+        mic = CommandMicrophone(args.audio_input_command)
+    elif args.audio_input_device is not None:
         try:
             args.audio_input_device = int(args.audio_input_device)
         except ValueError:
@@ -622,9 +629,6 @@ def _setup_logging(args: argparse.Namespace) -> None:
     )
 
 
-# -----------------------------------------------------------------------------
-
-
 def process_audio(state: ServerState, mic, block_size: int):
     """Process audio chunks from the microphone."""
     n_channels = state.audio_input_channels
@@ -638,6 +642,7 @@ def process_audio(state: ServerState, mic, block_size: int):
     has_oww = False
 
     last_active: Optional[float] = None
+    stop_word_was_active = False
     webrtc: Optional[WebRTCProcessor] = None
 
     try:
@@ -645,7 +650,7 @@ def process_audio(state: ServerState, mic, block_size: int):
         with mic.recorder(samplerate=16000, channels=n_channels, blocksize=block_size) as mic_in:
             while True:
                 # Shape: (block_size, n_channels) for stereo, (block_size, 1) for mono.
-                raw = mic_in.record(block_size)  # float32, range [-1, 1]
+                raw = mic_in.record(block_size)
                 mic_vol_scalar = max(0.1, min(1.0, state.mic_volume / 100.0))
 
                 # Build per-channel byte arrays.  Channel 0 is the primary
@@ -654,7 +659,13 @@ def process_audio(state: ServerState, mic, block_size: int):
                 channel_chunks: list[bytes] = []
                 for ch in range(n_channels):
                     col = raw[:, ch] if n_channels > 1 else raw.reshape(-1)
-                    chunk = (np.clip(col * mic_vol_scalar, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+                    if np.issubdtype(col.dtype, np.integer):
+                        if mic_vol_scalar == 1.0:
+                            chunk = col.astype("<i2", copy=False).tobytes()
+                        else:
+                            chunk = np.clip(col.astype(np.float32) * mic_vol_scalar, -32768.0, 32767.0).astype("<i2").tobytes()
+                    else:
+                        chunk = (np.clip(col * mic_vol_scalar, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
                     channel_chunks.append(chunk)
 
                 # Primary channel drives WebRTC and wake-word detection.
@@ -810,23 +821,7 @@ def process_audio(state: ServerState, mic, block_size: int):
                                 state.satellite.wakeup(wake_word)
                                 last_active = now
 
-                    # Always process to keep state correct
-                    stopped = False
-
-                    # No debugging when no detection
-                    state.stop_word.debug_probabilities = False
-
-                    # Apply stop word sensitivity threshold
-                    state.stop_word.probability_cutoff = state.stop_word_threshold
-                    # _LOGGER.debug("Set stop word probability cutoff to %.3f", state.stop_word_threshold)
-                    for micro_input in micro_inputs:
-                        if state.stop_word.process_streaming(micro_input):
-                            state.stop_word.debug_probabilities = True
-                            stopped = True
-
-                    if stopped and (state.stop_word.id in state.active_wake_words) and not state.muted:
-                        _LOGGER.debug("Stop word detected")
-                        state.satellite.stop()
+                    stop_word_was_active = process_stop_word(state, micro_inputs, stop_word_was_active)
                 except Exception:  # pylint: disable=broad-except
                     _LOGGER.exception("Unexpected error handling audio")
     except Exception:  # pylint: disable=broad-except

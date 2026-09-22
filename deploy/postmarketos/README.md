@@ -18,9 +18,15 @@ The keepalive holds the QDSP6/TAS5782M PCM path open with zero samples. Without
 it, the kernel powers the amplifier DSP down and its 0.7-0.8 second startup
 clips short sounds and the beginning of TTS playback.
 
-The local MicroWakeWord model currently uses about 30% of one CPU core. The
-archived Wyoming setup was lighter on this device because it sent microphone
-audio to the OpenWakeWord service at `192.168.68.116:10400` instead of running
+The launcher uses `parec` to provide stereo signed 16-bit PCM directly from
+PulseAudio. This avoids the CPU-heavy float conversion in the Python
+`soundcard` capture path while retaining the second reference channel used for
+AEC. The stop-word model only runs while TTS or a finished timer can actually
+be stopped. Together these changes reduce idle voice-assistant usage from
+about 36% to 17% of one CPU core on this device.
+
+The archived Wyoming setup remains lighter because it sends microphone audio
+to the OpenWakeWord service at `192.168.68.116:10400` instead of running
 wake-word inference locally.
 
 ## Enable services

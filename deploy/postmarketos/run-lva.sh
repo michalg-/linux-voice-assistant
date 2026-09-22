@@ -22,7 +22,7 @@ exec ./.venv/bin/python -m linux_voice_assistant \
   --name "ThinkSmart Voice LVA" \
   --network-interface wlan0 \
   --port 6053 \
-  --audio-input-device "Built-in Audio Stereo Microphone" \
+  --audio-input-command "parec --device=alsa_input.platform-c051000.sound-card.HiFi__Microphone__source --raw --format=s16le --rate=16000 --channels=2" \
   --audio-input-channels 2 \
   --audio-output-device "pulse/alsa_output.platform-c051000.sound-card.HiFi__Speaker__sink" \
   --music-output-device "pulse/alsa_output.platform-c051000.sound-card.HiFi__Speaker__sink" \
@@ -39,4 +39,3 @@ exec ./.venv/bin/python -m linux_voice_assistant \
   --unmute-sound /home/pmos/linux-voice-assistant/sounds/custom-loud/mute_switch_off.flac \
   --peripheral-startup-wait 0 \
   "$@"
-

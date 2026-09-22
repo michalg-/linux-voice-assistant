@@ -1,8 +1,11 @@
 """Unit tests for __main__.py — process_audio logic and argument parsing helpers."""
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 
+from linux_voice_assistant.wake_word import process_stop_word
 from tests.unit.conftest import make_state
 
 
@@ -140,6 +143,39 @@ class TestWakeWordRefractory:
 
 
 class TestStopWordLogic:
+    def test_stop_model_is_not_processed_while_inactive(self, tmp_path):
+        state = make_state(tmp_path)
+        state.active_wake_words = set()
+
+        active = process_stop_word(state, [np.zeros(40)], was_active=False)
+
+        assert active is False
+        state.stop_word.reset.assert_not_called()
+        state.stop_word.process_streaming.assert_not_called()
+
+    def test_stop_model_resets_on_activation_and_stops_playback(self, tmp_path):
+        state = make_state(tmp_path)
+        state.satellite = MagicMock()
+        state.active_wake_words = {state.stop_word.id}
+        state.stop_word.process_streaming.side_effect = [False, True]
+
+        active = process_stop_word(state, [np.zeros(40), np.ones(40)], was_active=False)
+
+        assert active is True
+        state.stop_word.reset.assert_called_once()
+        state.satellite.stop.assert_called_once()
+
+    def test_stop_model_is_not_reset_on_every_audio_block(self, tmp_path):
+        state = make_state(tmp_path)
+        state.satellite = MagicMock()
+        state.active_wake_words = {state.stop_word.id}
+        state.stop_word.process_streaming.return_value = False
+
+        active = process_stop_word(state, [np.zeros(40)], was_active=True)
+
+        assert active is True
+        state.stop_word.reset.assert_not_called()
+
     def test_stop_word_only_triggers_when_in_active_set(self, tmp_path):
         state = make_state(tmp_path)
         # Stop word not in active set → should not trigger stop
