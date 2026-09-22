@@ -1,11 +1,15 @@
 """Alternative audio input backends."""
 
+import logging
 import shlex
 import subprocess
+import time
 from types import TracebackType
 from typing import Optional, Type
 
 import numpy as np
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class CommandMicrophone:
@@ -32,7 +36,7 @@ class CommandRecorder:
         self._process: Optional[subprocess.Popen[bytes]] = None
 
     def __enter__(self) -> "CommandRecorder":
-        self._process = subprocess.Popen(self.command, stdout=subprocess.PIPE, bufsize=0)
+        self._start_process()
         return self
 
     def __exit__(
@@ -41,6 +45,35 @@ class CommandRecorder:
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> None:
+        self._stop_process()
+
+    def record(self, numframes: int) -> np.ndarray:
+        process = self._process
+        if process is None or process.stdout is None:
+            raise RuntimeError("Audio input command is not running")
+
+        expected_bytes = numframes * self.channels * 2
+        audio = bytearray()
+        while len(audio) < expected_bytes:
+            chunk = process.stdout.read(expected_bytes - len(audio))
+            if not chunk:
+                return_code = process.poll()
+                _LOGGER.warning("Audio input command stopped unexpectedly (exit code %s); restarting", return_code)
+                self._stop_process()
+                time.sleep(1)
+                self._start_process()
+                process = self._process
+                assert process is not None and process.stdout is not None
+                audio.clear()
+                continue
+            audio.extend(chunk)
+
+        return np.frombuffer(audio, dtype="<i2").reshape(numframes, self.channels)
+
+    def _start_process(self) -> None:
+        self._process = subprocess.Popen(self.command, stdout=subprocess.PIPE, bufsize=0)
+
+    def _stop_process(self) -> None:
         process = self._process
         self._process = None
         if process is None:
@@ -57,19 +90,3 @@ class CommandRecorder:
                 process.wait()
         else:
             process.wait()
-
-    def record(self, numframes: int) -> np.ndarray:
-        process = self._process
-        if process is None or process.stdout is None:
-            raise RuntimeError("Audio input command is not running")
-
-        expected_bytes = numframes * self.channels * 2
-        audio = bytearray()
-        while len(audio) < expected_bytes:
-            chunk = process.stdout.read(expected_bytes - len(audio))
-            if not chunk:
-                return_code = process.poll()
-                raise RuntimeError(f"Audio input command stopped unexpectedly (exit code {return_code})")
-            audio.extend(chunk)
-
-        return np.frombuffer(audio, dtype="<i2").reshape(numframes, self.channels)

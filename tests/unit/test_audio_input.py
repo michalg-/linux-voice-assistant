@@ -31,13 +31,23 @@ def test_command_microphone_rejects_empty_command():
         CommandMicrophone("   ")
 
 
-def test_command_microphone_reports_early_exit():
-    process = MagicMock()
-    process.stdout = io.BytesIO(b"\x01\x00")
-    process.poll.return_value = 7
+def test_command_microphone_restarts_after_early_exit():
+    stopped_process = MagicMock()
+    stopped_process.stdout = io.BytesIO(b"\x01\x00")
+    stopped_process.poll.return_value = 7
+    replacement_process = MagicMock()
+    replacement_process.stdout = io.BytesIO(b"\x02\x00\x03\x00")
+    replacement_process.poll.return_value = None
 
-    with patch("linux_voice_assistant.audio_input.subprocess.Popen", return_value=process):
+    with (
+        patch("linux_voice_assistant.audio_input.subprocess.Popen", side_effect=[stopped_process, replacement_process]) as popen,
+        patch("linux_voice_assistant.audio_input.time.sleep") as sleep,
+    ):
         mic = CommandMicrophone("parec --raw")
         with mic.recorder(samplerate=16000, channels=1, blocksize=2) as recorder:
-            with pytest.raises(RuntimeError, match="exit code 7"):
-                recorder.record(2)
+            result = recorder.record(2)
+
+    assert popen.call_count == 2
+    sleep.assert_called_once_with(1)
+    np.testing.assert_array_equal(result, np.array([[2], [3]], dtype="<i2"))
+    replacement_process.terminate.assert_called_once()
